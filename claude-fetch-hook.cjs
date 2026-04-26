@@ -1,5 +1,4 @@
 const fs = require('node:fs/promises');
-const fsSync = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -20,8 +19,7 @@ const crypto = require('node:crypto');
 
     // logPath = ~/.claude/fetch_hooks.jsonl
     const logPath = path.join(process.env.HOME || os.homedir(), '.claude', 'fetch_hooks.jsonl');
-    const bodyDir = path.join(process.env.HOME || os.homedir(), '.claude', 'fetch_bodies');
-    const pendingTasks = new Set();
+    let writeQueue = Promise.resolve();
 
     function nowIso() {
         return new Date().toISOString();
@@ -48,10 +46,6 @@ const crypto = require('node:crypto');
         }
 
         return /^(text\/)|json|xml|yaml|javascript|ecmascript|x-www-form-urlencoded|text\/event-stream/i.test(contentType);
-    }
-
-    function isEventStream(contentType) {
-        return /text\/event-stream/i.test(contentType || '');
     }
 
     function normalizeHeaders(headersLike) {
@@ -236,146 +230,15 @@ const crypto = require('node:crypto');
     }
 
     function appendRecord(record) {
-        try {
-            fsSync.mkdirSync(path.dirname(logPath), { recursive: true });
-            fsSync.appendFileSync(logPath, `${JSON.stringify(record)}\n`, 'utf8');
-        } catch {
-            // Best-effort audit hook: never break the caller because logging failed.
-        }
-        return Promise.resolve();
+        writeQueue = writeQueue
+            .then(async () => {
+                await fs.mkdir(path.dirname(logPath), { recursive: true });
+                await fs.appendFile(logPath, `${JSON.stringify(record)}\n`, 'utf8');
+            })
+            .catch(() => { });
+
+        return writeQueue;
     }
-
-    function trackTask(task) {
-        pendingTasks.add(task);
-        task.finally(() => {
-            pendingTasks.delete(task);
-        });
-        return task;
-    }
-
-    async function flushPendingTasks() {
-        if (pendingTasks.size === 0) {
-            return;
-        }
-
-        await Promise.allSettled(Array.from(pendingTasks));
-    }
-
-    async function captureEventStream(response, fetchId, startedAt, request, responseMeta) {
-        const headers = normalizeHeaders(response.headers);
-        const contentType = getHeader(headers, 'content-type');
-        const clone = response.clone();
-
-        if (!clone.body) {
-            return null;
-        }
-
-        const finalPath = path.join(bodyDir, `${fetchId}.sse`);
-        const partialPath = `${finalPath}.partial`;
-        fsSync.mkdirSync(path.dirname(finalPath), { recursive: true });
-        fsSync.writeFileSync(partialPath, '');
-
-        await appendRecord({
-            ts: nowIso(),
-            event: 'fetch_response_stream_start',
-            fetch_id: fetchId,
-            pid: process.pid,
-            duration_ms: Date.now() - startedAt,
-            request: {
-                url: request.url,
-                method: request.method,
-            },
-            response: {
-                ...responseMeta,
-                body: {
-                    content_type: contentType || null,
-                    encoding: 'raw-bytes',
-                    dump_path: finalPath,
-                    partial_dump_path: partialPath,
-                },
-            },
-        });
-
-        const reader = clone.body.getReader();
-        let sizeBytes = 0;
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
-                }
-
-                if (!value || value.byteLength === 0) {
-                    continue;
-                }
-
-                const chunk = Buffer.from(value);
-                fsSync.appendFileSync(partialPath, chunk);
-                sizeBytes += chunk.length;
-            }
-
-            fsSync.renameSync(partialPath, finalPath);
-
-            await appendRecord({
-                ts: nowIso(),
-                event: 'fetch_response_stream_complete',
-                fetch_id: fetchId,
-                pid: process.pid,
-                duration_ms: Date.now() - startedAt,
-                request: {
-                    url: request.url,
-                    method: request.method,
-                },
-                response: {
-                    ...responseMeta,
-                    body: {
-                        content_type: contentType || null,
-                        encoding: 'raw-bytes',
-                        dump_path: finalPath,
-                        size_bytes: sizeBytes,
-                    },
-                },
-            });
-        } catch (error) {
-            await appendRecord({
-                ts: nowIso(),
-                event: 'fetch_response_stream_error',
-                fetch_id: fetchId,
-                pid: process.pid,
-                duration_ms: Date.now() - startedAt,
-                request: {
-                    url: request.url,
-                    method: request.method,
-                },
-                response: {
-                    ...responseMeta,
-                    body: {
-                        content_type: contentType || null,
-                        encoding: 'raw-bytes',
-                        dump_path: finalPath,
-                        partial_dump_path: partialPath,
-                        size_bytes: sizeBytes,
-                    },
-                },
-                error: safeError(error),
-            });
-        } finally {
-            try {
-                reader.releaseLock();
-            } catch {
-                // Ignore reader cleanup failures.
-            }
-        }
-    }
-
-    process.on('beforeExit', () => {
-        if (pendingTasks.size === 0) {
-            return;
-        }
-
-        return flushPendingTasks();
-    });
 
     void appendRecord({
         ts: nowIso(),
@@ -426,14 +289,8 @@ const crypto = require('node:crypto');
                 response: responseMeta,
             });
 
-            const contentType = getHeader(responseHeaders, 'content-type');
-            trackTask((async () => {
+            (async () => {
                 try {
-                    if (isEventStream(contentType)) {
-                        await captureEventStream(response, fetchId, startedAt, request, responseMeta);
-                        return;
-                    }
-
                     const responseBody = await extractResponseBody(response);
                     await appendRecord({
                         ts: nowIso(),
@@ -464,7 +321,7 @@ const crypto = require('node:crypto');
                         error: safeError(error),
                     });
                 }
-            })());
+            })();
 
             return response;
         } catch (error) {
